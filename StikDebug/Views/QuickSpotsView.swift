@@ -108,6 +108,20 @@ struct QuickSpotsView: View {
     @State private var styleToast: String?
     @State private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
+    // Movement modes
+    @StateObject private var engine = MoveEngine()
+    @State private var mode: MoveMode = .pin
+    @State private var moveSpeed: MoveSpeed = .walk
+    @State private var mapCenter: CLLocationCoordinate2D?
+    @State private var cameraDistance: Double = 1200
+    @State private var driveStart: CLLocationCoordinate2D?
+    @State private var driveEnd: CLLocationCoordinate2D?
+    @State private var driveRoute: [CLLocationCoordinate2D] = []
+    @State private var isRouting = false
+    @State private var drawPath: [CLLocationCoordinate2D] = []
+    @State private var penOn = false
+    @State private var strokeActive = false
+
     private static let storageKey = "locationBookmarks"
 
     private var mapStyle: TeleportMapStyle { TeleportMapStyle(rawValue: mapStyleRaw) ?? .standard }
@@ -131,7 +145,9 @@ struct QuickSpotsView: View {
                 }
                 VStack(spacing: 0) {
                     if !searchFocused {
-                        spotChips
+                        modePanel
+                            .padding(.bottom, 10)
+                        modePicker
                             .padding(.bottom, 10)
                     }
                     bottomBar
@@ -143,11 +159,22 @@ struct QuickSpotsView: View {
                 .onTapGesture { }
             }
             .animation(.spring(response: 0.35, dampingFraction: 0.85), value: searchFocused)
+            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: mode)
             .animation(.spring(response: 0.35, dampingFraction: 0.85), value: searchCompleter.results.count)
         }
         .toolbar(.hidden, for: .tabBar)
         .onAppear {
             loadSpots()
+            connectIfNeeded()
+            engine.onError = { code in
+                errorMessage = "Movement stopped (error \(code)). Make sure LocalDevVPN is on and you're on Wi-Fi."
+                if let last = engine.current { resumeResending(at: last) }
+            }
+            engine.onFinish = { end in
+                activeName = "Arrived"
+                resumeResending(at: end)
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            }
             if isActive, let coordinate = session.coordinate {
                 selected = coordinate
                 position = .region(region(around: coordinate))
@@ -155,10 +182,22 @@ struct QuickSpotsView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             // Re-check the pairing file and connection whenever the app comes back.
-            if phase == .active { refreshTick += 1 }
+            if phase == .active {
+                refreshTick += 1
+                connectIfNeeded()
+            }
         }
         .onChange(of: showMenu) { _, open in
-            if !open { refreshTick += 1 }
+            if !open {
+                refreshTick += 1
+                connectIfNeeded()
+            }
+        }
+        .onReceive(engine.$current) { coordinate in
+            guard engine.isMoving, let coordinate else { return }
+            withAnimation(.linear(duration: 0.5)) {
+                position = .camera(MapCamera(centerCoordinate: coordinate, distance: cameraDistance))
+            }
         }
         .sheet(isPresented: $showMenu) { menuSheet }
         .alert("Save Spot", isPresented: $showSavePrompt) {
@@ -196,6 +235,24 @@ struct QuickSpotsView: View {
                     Marker(selectedName ?? "Selected", systemImage: "mappin", coordinate: selected)
                         .tint(.red)
                 }
+                if mode == .drive {
+                    if driveRoute.count > 1 {
+                        MapPolyline(coordinates: driveRoute)
+                            .stroke(Color.blue.opacity(0.85), lineWidth: 6)
+                    }
+                    if let driveStart {
+                        Marker("Start", systemImage: "flag.fill", coordinate: driveStart)
+                            .tint(.green)
+                    }
+                    if let driveEnd {
+                        Marker("End", systemImage: "flag.checkered", coordinate: driveEnd)
+                            .tint(.red)
+                    }
+                }
+                if mode == .draw, drawPath.count > 1 {
+                    MapPolyline(coordinates: drawPath)
+                        .stroke(Color.purple.opacity(0.9), style: StrokeStyle(lineWidth: 6, lineCap: .round, lineJoin: .round))
+                }
                 if isActive, let active = session.coordinate {
                     Annotation(activeName ?? "Teleported", coordinate: active, anchor: .center) {
                         ZStack {
@@ -208,13 +265,49 @@ struct QuickSpotsView: View {
             }
             .mapStyle(mapStyle.mapStyle)
             .mapControls { }
+            .onMapCameraChange(frequency: .onEnd) { context in
+                mapCenter = context.region.center
+                cameraDistance = context.camera.distance
+            }
+            .overlay {
+                if mode == .draw && penOn {
+                    // Finger draws a path instead of moving the map.
+                    Color.white.opacity(0.001)
+                        .contentShape(Rectangle())
+                        .gesture(
+                            DragGesture(minimumDistance: 0)
+                                .onChanged { value in
+                                    if !strokeActive {
+                                        strokeActive = true
+                                        drawPath = []
+                                    }
+                                    guard let coordinate = proxy.convert(value.location, from: .local) else { return }
+                                    if let last = drawPath.last, MoveEngine.distance(last, coordinate) < 3 { return }
+                                    drawPath.append(coordinate)
+                                }
+                                .onEnded { _ in
+                                    strokeActive = false
+                                    penOn = false
+                                    if drawPath.count > 1 {
+                                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                                    }
+                                }
+                        )
+                }
+            }
             .onTapGesture { point in
                 if searchFocused {
                     searchFocused = false
                     return
                 }
-                if let coordinate = proxy.convert(point, from: .local) {
-                    UISelectionFeedbackGenerator().selectionChanged()
+                guard let coordinate = proxy.convert(point, from: .local) else { return }
+                UISelectionFeedbackGenerator().selectionChanged()
+                switch mode {
+                case .drive:
+                    handleDriveTap(coordinate)
+                case .draw:
+                    break
+                case .pin, .joystick:
                     selected = coordinate
                     selectedName = nil
                 }
@@ -271,6 +364,8 @@ struct QuickSpotsView: View {
         .onTapGesture {
             if isActive, let coordinate = session.coordinate {
                 withAnimation { position = .region(region(around: coordinate)) }
+            } else if !tunnel.isConnected {
+                connectIfNeeded()
             }
         }
     }
@@ -278,14 +373,21 @@ struct QuickSpotsView: View {
     private var statusColor: Color {
         if !hasPairingFile { return .red }
         if isActive { return .green }
-        return tunnel.isConnected ? .gray : .orange
+        if tunnel.isConnected { return .gray }
+        return tunnel.isStarting ? .yellow : .orange
     }
 
     private var statusText: String {
         _ = refreshTick
         if !hasPairingFile { return "Pairing file needed" }
+        if engine.isMoving {
+            if engine.kind == .joystick { return "Joystick · \(moveSpeed.label)" }
+            return "\(activeName ?? "Moving") · \(Int(engine.progress * 100))%"
+        }
         if isActive { return "Teleport on: \(activeName ?? "Pinned spot")" }
-        return tunnel.isConnected ? "Real location" : "Turn on LocalDevVPN"
+        if tunnel.isConnected { return "Real location" }
+        if tunnel.isStarting { return "Connecting…" }
+        return "Not connected – tap to retry"
     }
 
     // MARK: Bottom
@@ -381,13 +483,31 @@ struct QuickSpotsView: View {
             .teleportGlass(Capsule())
 
             if !searchFocused {
-                roundAction(icon: "location.north.fill", color: .blue, label: "Teleport here",
-                            enabled: canTeleport, loading: isBusy) {
-                    if let selected { go(to: selected, name: selectedName) }
+                switch mode {
+                case .pin, .joystick:
+                    roundAction(icon: "location.north.fill", color: .blue, label: "Teleport here",
+                                enabled: canTeleport, loading: isBusy) {
+                        if let selected { go(to: selected, name: selectedName) }
+                    }
+                case .drive:
+                    roundAction(icon: "play.fill", color: .blue, label: "Start drive",
+                                enabled: driveRoute.count > 1 && !engine.isMoving, loading: isRouting) {
+                        startPath(driveRoute, label: "Driving")
+                    }
+                case .draw:
+                    roundAction(icon: "play.fill", color: .blue, label: "Follow drawing",
+                                enabled: drawPath.count > 1 && !engine.isMoving) {
+                        startPath(drawPath, label: "Following line")
+                    }
                 }
-                roundAction(icon: "stop.fill", color: .red, label: "Stop teleport",
-                            enabled: isActive) {
-                    stop()
+                roundAction(icon: engine.isMoving ? "pause.fill" : "stop.fill", color: .red,
+                            label: engine.isMoving ? "Stop moving" : "Stop teleport",
+                            enabled: isActive || engine.isMoving) {
+                    if engine.isMoving {
+                        stopMoving()
+                    } else {
+                        stop()
+                    }
                 }
                 roundAction(icon: isSelectedSaved ? "star.fill" : "star", color: .yellow, label: "Save spot",
                             enabled: selected != nil && !isSelectedSaved) {
@@ -444,6 +564,227 @@ struct QuickSpotsView: View {
         }
         .padding(.vertical, 4)
         .teleportGlass(RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    // MARK: Modes
+
+    private var modePicker: some View {
+        HStack(spacing: 4) {
+            ForEach(MoveMode.allCases) { item in
+                Button {
+                    switchMode(to: item)
+                } label: {
+                    Image(systemName: item.icon)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundStyle(mode == item ? Color.white : Color.primary)
+                        .frame(width: 48, height: 36)
+                        .background {
+                            if mode == item {
+                                Capsule().fill(Color.blue.opacity(0.85))
+                            }
+                        }
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(PressableStyle())
+                .accessibilityLabel(item.label)
+            }
+        }
+        .padding(4)
+        .teleportGlass(Capsule())
+    }
+
+    @ViewBuilder
+    private var modePanel: some View {
+        switch mode {
+        case .pin:
+            spotChips
+        case .joystick:
+            VStack(spacing: 10) {
+                HStack {
+                    JoystickPad(
+                        onStart: { startJoystickIfNeeded() },
+                        onChange: { vector in engine.vector = vector }
+                    )
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                speedRow
+            }
+        case .drive:
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    hintChip(driveHint, icon: "car.fill")
+                    if driveStart != nil {
+                        smallChip("Reset", icon: "arrow.counterclockwise", selected: false) { resetDrive() }
+                    }
+                }
+                speedRow
+            }
+        case .draw:
+            VStack(spacing: 8) {
+                HStack(spacing: 8) {
+                    smallChip(penOn ? "Draw with your finger" : (drawPath.isEmpty ? "Tap to draw a path" : "Draw again"),
+                              icon: "pencil.tip", selected: penOn) {
+                        penOn.toggle()
+                    }
+                    if !drawPath.isEmpty && !penOn {
+                        smallChip("Clear", icon: "trash", selected: false) { drawPath = [] }
+                    }
+                }
+                speedRow
+            }
+        }
+    }
+
+    private var speedRow: some View {
+        HStack(spacing: 8) {
+            ForEach(MoveSpeed.allCases) { item in
+                smallChip(item.label, icon: item.icon, selected: moveSpeed == item) {
+                    moveSpeed = item
+                    engine.speed = item.metersPerSecond
+                }
+            }
+        }
+    }
+
+    private var driveHint: String {
+        if driveStart == nil { return "Tap the map to set the start" }
+        if driveEnd == nil { return "Now tap where to end" }
+        if isRouting { return "Finding a route…" }
+        if engine.isMoving { return "Driving…" }
+        let miles = MoveEngine.length(of: driveRoute) / 1609.34
+        return String(format: "%.1f mi route · tap ▶ to drive", miles)
+    }
+
+    private func smallChip(_ title: String, icon: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button {
+            UISelectionFeedbackGenerator().selectionChanged()
+            action()
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.caption.weight(.bold))
+                Text(title).font(.footnote.weight(.semibold)).lineLimit(1)
+            }
+            .foregroundStyle(selected ? Color.white : Color.primary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .teleportGlass(Capsule(), tint: selected ? .blue : nil)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(PressableStyle())
+    }
+
+    private func hintChip(_ text: String, icon: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon).font(.caption.weight(.bold))
+            Text(text).font(.footnote.weight(.semibold)).lineLimit(1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .teleportGlass(Capsule())
+    }
+
+    private func switchMode(to newMode: MoveMode) {
+        guard newMode != mode else { return }
+        if engine.kind == .joystick { stopMoving() }
+        penOn = (newMode == .draw && drawPath.isEmpty)
+        switch newMode {
+        case .drive:
+            if moveSpeed != .drive { moveSpeed = .drive }
+        case .joystick, .draw:
+            if moveSpeed == .drive { moveSpeed = .walk }
+        case .pin:
+            break
+        }
+        engine.speed = moveSpeed.metersPerSecond
+        mode = newMode
+    }
+
+    private var startingPoint: CLLocationCoordinate2D? {
+        engine.current.flatMap { engine.isMoving ? $0 : nil }
+            ?? (isActive ? session.coordinate : nil)
+            ?? selected
+            ?? mapCenter
+    }
+
+    private func startJoystickIfNeeded() {
+        guard engine.kind != .joystick else { return }
+        guard hasPairingFile else {
+            errorMessage = "Import your pairing file first (gear button → Settings & Pairing File)."
+            return
+        }
+        guard let start = startingPoint else {
+            errorMessage = "Drop a pin first so the joystick knows where to start."
+            return
+        }
+        activeName = "Joystick"
+        engine.speed = moveSpeed.metersPerSecond
+        engine.startJoystick(at: start)
+        beginBackgroundTask()
+    }
+
+    private func startPath(_ coordinates: [CLLocationCoordinate2D], label: String) {
+        guard hasPairingFile else {
+            errorMessage = "Import your pairing file first (gear button → Settings & Pairing File)."
+            return
+        }
+        guard coordinates.count > 1, !isBusy else { return }
+        activeName = label
+        engine.speed = moveSpeed.metersPerSecond
+        engine.follow(coordinates)
+        beginBackgroundTask()
+    }
+
+    private func stopMoving() {
+        if let last = engine.stop() {
+            activeName = "Stopped here"
+            resumeResending(at: last)
+        }
+    }
+
+    private func handleDriveTap(_ coordinate: CLLocationCoordinate2D) {
+        guard !engine.isMoving else { return }
+        if driveStart == nil || driveEnd != nil {
+            driveStart = coordinate
+            driveEnd = nil
+            driveRoute = []
+        } else {
+            driveEnd = coordinate
+            buildDriveRoute()
+        }
+    }
+
+    private func resetDrive() {
+        if engine.kind == .path { stopMoving() }
+        driveStart = nil
+        driveEnd = nil
+        driveRoute = []
+    }
+
+    private func buildDriveRoute() {
+        guard let start = driveStart, let end = driveEnd else { return }
+        isRouting = true
+        let request = MKDirections.Request()
+        request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
+        request.destination = MKMapItem(placemark: MKPlacemark(coordinate: end))
+        request.transportType = .automobile
+        MKDirections(request: request).calculate { response, _ in
+            DispatchQueue.main.async {
+                isRouting = false
+                // Ignore a stale answer if the pins changed meanwhile.
+                guard driveStart.map({ isSame($0, start) }) == true,
+                      driveEnd.map({ isSame($0, end) }) == true else { return }
+                if let route = response?.routes.first {
+                    var coordinates = MoveEngine.coordinates(of: route.polyline)
+                    coordinates.insert(start, at: 0)
+                    coordinates.append(end)
+                    driveRoute = coordinates
+                } else {
+                    // No road found (e.g. off-road): drive in a straight line instead.
+                    driveRoute = [start, end]
+                }
+            }
+        }
     }
 
     // MARK: Buttons
@@ -558,6 +899,7 @@ struct QuickSpotsView: View {
             return
         }
         searchFocused = false
+        if engine.isMoving { engine.stop() }
         guard !isBusy else {
             // Still finishing the last request: remember the newest tap and run it next.
             pending = .go(coordinate, name)
@@ -579,6 +921,7 @@ struct QuickSpotsView: View {
                 isBusy = false
                 defer { runPending() }
                 guard code == 0 else {
+                    connectIfNeeded()
                     errorMessage = "Error \(code). Make sure LocalDevVPN is on and you're on Wi-Fi, then try again."
                     if isActive, let previous = session.coordinate {
                         resumeResending(at: previous)
@@ -592,6 +935,12 @@ struct QuickSpotsView: View {
                 resumeResending(at: coordinate)
             }
         }
+    }
+
+    /// Teleport is the only visible screen now, so it has to start the device connection itself.
+    private func connectIfNeeded() {
+        guard hasPairingFile, !tunnel.isConnected, !tunnel.isStarting else { return }
+        startTunnelInBackground(showErrorUI: false)
     }
 
     private func resumeResending(at coordinate: CLLocationCoordinate2D) {
@@ -614,6 +963,7 @@ struct QuickSpotsView: View {
     }
 
     private func stop() {
+        if engine.isMoving { engine.stop() }
         guard !isBusy else {
             pending = .stop
             return
@@ -751,5 +1101,74 @@ struct QuickSpotsView: View {
 
     private func format(_ coordinate: CLLocationCoordinate2D) -> String {
         String(format: "%.5f, %.5f", coordinate.latitude, coordinate.longitude)
+    }
+}
+
+// MARK: - Joystick
+
+private struct JoystickPad: View {
+    let onStart: () -> Void
+    let onChange: (CGVector) -> Void
+
+    @State private var knob: CGSize = .zero
+    @State private var dragging = false
+    private let radius: CGFloat = 44
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.clear)
+                .frame(width: 132, height: 132)
+                .teleportGlass(Circle())
+            Image(systemName: "chevron.up")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .offset(y: -50)
+            Image(systemName: "chevron.down")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .offset(y: 50)
+            Image(systemName: "chevron.left")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .offset(x: -50)
+            Image(systemName: "chevron.right")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .offset(x: 50)
+            Circle()
+                .fill(Color.white.opacity(dragging ? 0.95 : 0.8))
+                .frame(width: 54, height: 54)
+                .shadow(color: .black.opacity(0.2), radius: 6, y: 2)
+                .offset(knob)
+        }
+        .frame(width: 132, height: 132)
+        .contentShape(Circle())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    if !dragging {
+                        dragging = true
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        onStart()
+                    }
+                    var dx = value.translation.width
+                    var dy = value.translation.height
+                    let length = hypot(dx, dy)
+                    if length > radius {
+                        dx = dx / length * radius
+                        dy = dy / length * radius
+                    }
+                    knob = CGSize(width: dx, height: dy)
+                    // Screen "up" is north.
+                    onChange(CGVector(dx: dx / radius, dy: -dy / radius))
+                }
+                .onEnded { _ in
+                    dragging = false
+                    withAnimation(.spring(response: 0.25, dampingFraction: 0.6)) { knob = .zero }
+                    onChange(.zero)
+                }
+        )
+        .accessibilityLabel("Joystick")
     }
 }
