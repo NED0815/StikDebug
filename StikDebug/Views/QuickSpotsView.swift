@@ -1,21 +1,77 @@
 //
 //  QuickSpotsView.swift
-//  StikDebug
+//  Teleport
 //
-//  A simple, one-screen location picker: pick a spot, tap Go,
-//  save favorites and jump between them with one tap.
-//  Shares saved spots with the full Location tool ("locationBookmarks").
+//  Full-screen map with floating Liquid Glass controls.
+//  Pick a spot, tap Teleport, save favorites and jump between them.
+//  Saved spots are shared with the full Location tool ("locationBookmarks").
 //
 
 import SwiftUI
 import MapKit
 import UIKit
 
+// MARK: - Glass helpers
+
+private extension View {
+    /// Real Liquid Glass on iOS 26+, frosted material on older versions.
+    @ViewBuilder
+    func teleportGlass<S: Shape>(_ shape: S, tint: Color? = nil) -> some View {
+        if #available(iOS 26, *) {
+            if let tint {
+                self.glassEffect(.regular.tint(tint.opacity(0.35)).interactive(), in: shape)
+            } else {
+                self.glassEffect(.regular.interactive(), in: shape)
+            }
+        } else {
+            self
+                .background(.ultraThinMaterial, in: shape)
+                .overlay(shape.stroke(.white.opacity(0.35), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        }
+    }
+}
+
+private enum TeleportMapStyle: Int, CaseIterable {
+    case standard, hybrid, satellite
+
+    var next: TeleportMapStyle {
+        TeleportMapStyle(rawValue: (rawValue + 1) % TeleportMapStyle.allCases.count) ?? .standard
+    }
+
+    var mapStyle: MapStyle {
+        switch self {
+        case .standard: return .standard(elevation: .realistic)
+        case .hybrid: return .hybrid(elevation: .realistic)
+        case .satellite: return .imagery(elevation: .realistic)
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .standard: return "map"
+        case .hybrid: return "map.fill"
+        case .satellite: return "globe.americas.fill"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .standard: return "Standard"
+        case .hybrid: return "Hybrid"
+        case .satellite: return "Satellite"
+        }
+    }
+}
+
+// MARK: - Main view
+
 struct QuickSpotsView: View {
     @ObservedObject private var tunnel = TunnelManager.shared
     @ObservedObject private var session = LocationSimulationSession.shared
     @StateObject private var searchCompleter = LocationSearchCompleter()
 
+    @AppStorage("teleportMapStyle") private var mapStyleRaw = TeleportMapStyle.standard.rawValue
     @State private var position: MapCameraPosition = .userLocation(fallback: .automatic)
     @State private var selected: CLLocationCoordinate2D?
     @State private var selectedName: String?
@@ -26,59 +82,70 @@ struct QuickSpotsView: View {
     @FocusState private var searchFocused: Bool
 
     @State private var isBusy = false
-    @State private var showSaveSheet = false
+    @State private var showSavePrompt = false
     @State private var saveName = ""
     @State private var renamingSpot: LocationBookmark?
     @State private var renameText = ""
     @State private var errorMessage: String?
+    @State private var showMenu = false
+    @State private var styleToast: String?
     @State private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
     private static let storageKey = "locationBookmarks"
 
+    private var mapStyle: TeleportMapStyle { TeleportMapStyle(rawValue: mapStyleRaw) ?? .standard }
     private var pairingPath: String { PairingFileStore.prepareURL().path }
     private var hasPairingFile: Bool { FileManager.default.fileExists(atPath: pairingPath) }
     private var isActive: Bool { session.isActive && session.routeCoordinates == nil }
 
-    // MARK: - Body
-
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(spacing: 16) {
-                    statusCard
-                    mapCard
-                    actionButtons
-                    spotsSection
+        ZStack {
+            mapLayer
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                topBar
+                Spacer(minLength: 0)
+                if searchFocused && !searchCompleter.results.isEmpty {
+                    searchResults
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 8)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
-                .padding(.horizontal, 16)
-                .padding(.bottom, 24)
+                if !searchFocused {
+                    spotChips
+                        .padding(.bottom, 10)
+                }
+                bottomBar
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
             }
-            .scrollDismissesKeyboard(.interactively)
-            .background(Color(.systemGroupedBackground).ignoresSafeArea())
-            .navigationTitle("Spots")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        if let coordinate = session.coordinate ?? selected {
-                            withAnimation { position = .region(region(around: coordinate)) }
-                        } else {
-                            withAnimation { position = .userLocation(fallback: .automatic) }
-                        }
-                    } label: {
-                        Image(systemName: "scope")
-                    }
-                    .accessibilityLabel("Recenter map")
-                }
+            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: searchFocused)
+            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: searchCompleter.results.count)
+
+            if isBusy {
+                ProgressView()
+                    .controlSize(.large)
+                    .padding(22)
+                    .teleportGlass(RoundedRectangle(cornerRadius: 22, style: .continuous))
             }
         }
+        .toolbar(.hidden, for: .tabBar)
         .onAppear {
             loadSpots()
-            if let coordinate = session.coordinate, isActive {
+            if isActive, let coordinate = session.coordinate {
                 selected = coordinate
                 position = .region(region(around: coordinate))
             }
         }
-        .sheet(isPresented: $showSaveSheet) { saveSheet }
+        .sheet(isPresented: $showMenu) { menuSheet }
+        .alert("Save Spot", isPresented: $showSavePrompt) {
+            TextField("e.g. Main Gate", text: $saveName)
+            Button("Save") { saveSelected() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(selected.map { format($0) } ?? "")
+        }
         .alert("Rename Spot", isPresented: Binding(
             get: { renamingSpot != nil },
             set: { if !$0 { renamingSpot = nil } }
@@ -87,7 +154,7 @@ struct QuickSpotsView: View {
             Button("Save") { commitRename() }
             Button("Cancel", role: .cancel) { renamingSpot = nil }
         }
-        .alert("Couldn't Change Location", isPresented: Binding(
+        .alert("Couldn't Teleport", isPresented: Binding(
             get: { errorMessage != nil },
             set: { if !$0 { errorMessage = nil } }
         )) {
@@ -97,280 +164,154 @@ struct QuickSpotsView: View {
         }
     }
 
-    // MARK: - Status
+    // MARK: Map
 
-    private var statusCard: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(statusColor.opacity(0.18))
-                    .frame(width: 44, height: 44)
-                Image(systemName: statusIcon)
-                    .font(.system(size: 20, weight: .semibold))
-                    .foregroundStyle(statusColor)
+    private var mapLayer: some View {
+        MapReader { proxy in
+            Map(position: $position) {
+                UserAnnotation()
+                if let selected, !(isActive && isSame(selected, session.coordinate)) {
+                    Marker(selectedName ?? "Selected", systemImage: "mappin", coordinate: selected)
+                        .tint(.red)
+                }
+                if isActive, let active = session.coordinate {
+                    Annotation(activeName ?? "Teleported", coordinate: active, anchor: .center) {
+                        ZStack {
+                            Circle().fill(Color.blue.opacity(0.18)).frame(width: 54, height: 54)
+                            Circle().fill(Color.white).frame(width: 24, height: 24)
+                            Circle().fill(Color.blue).frame(width: 16, height: 16)
+                        }
+                    }
+                }
             }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(statusTitle)
-                    .font(.headline)
-                Text(statusSubtitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+            .mapStyle(mapStyle.mapStyle)
+            .mapControls { }
+            .onTapGesture { point in
+                if searchFocused {
+                    searchFocused = false
+                    return
+                }
+                if let coordinate = proxy.convert(point, from: .local) {
+                    UISelectionFeedbackGenerator().selectionChanged()
+                    selected = coordinate
+                    selectedName = nil
+                }
             }
-            Spacer(minLength: 0)
         }
-        .padding(14)
-        .background(.background, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    // MARK: Top
+
+    private var topBar: some View {
+        HStack(alignment: .top) {
+            statusPill
+            Spacer()
+            VStack(spacing: 10) {
+                circleButton(icon: mapStyle.icon, label: "Map style") {
+                    mapStyleRaw = mapStyle.next.rawValue
+                    flashStyleToast(mapStyle.label)
+                }
+                circleButton(icon: "location.fill", label: "Recenter") { recenter() }
+                circleButton(icon: "gearshape.fill", label: "Settings") { showMenu = true }
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .overlay(alignment: .top) {
+            if let styleToast {
+                Text(styleToast)
+                    .font(.subheadline.weight(.semibold))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .teleportGlass(Capsule())
+                    .padding(.top, 54)
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+            }
+        }
+    }
+
+    private var statusPill: some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(statusColor)
+                .frame(width: 9, height: 9)
+            Text(statusText)
+                .font(.footnote.weight(.semibold))
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .teleportGlass(Capsule())
+        .onTapGesture {
+            if isActive, let coordinate = session.coordinate {
+                withAnimation { position = .region(region(around: coordinate)) }
+            }
+        }
     }
 
     private var statusColor: Color {
         if !hasPairingFile { return .red }
         if isActive { return .green }
-        return tunnel.isConnected ? .blue : .orange
+        return tunnel.isConnected ? .gray : .orange
     }
 
-    private var statusIcon: String {
-        if !hasPairingFile { return "exclamationmark.triangle.fill" }
-        if isActive { return "location.fill" }
-        return tunnel.isConnected ? "checkmark" : "wifi.exclamationmark"
-    }
-
-    private var statusTitle: String {
+    private var statusText: String {
         if !hasPairingFile { return "Pairing file needed" }
-        if isActive { return "Location is set" }
-        return "Using real location"
+        if isActive { return "Teleport on: \(activeName ?? "Pinned spot")" }
+        return tunnel.isConnected ? "Real location" : "Turn on LocalDevVPN"
     }
 
-    private var statusSubtitle: String {
-        if !hasPairingFile { return "Import your pairing file in Settings first." }
-        if isActive {
-            if let activeName { return activeName }
-            if let coordinate = session.coordinate { return format(coordinate) }
-            return "Simulated location active"
-        }
-        return tunnel.isConnected
-            ? "Pick a spot or tap a saved one."
-            : "Turn on LocalDevVPN, then try again."
-    }
+    // MARK: Bottom
 
-    // MARK: - Map
-
-    private var mapCard: some View {
-        VStack(spacing: 0) {
-            searchBar
-            if !searchCompleter.results.isEmpty && searchFocused {
-                searchResults
-            }
-            MapReader { proxy in
-                Map(position: $position) {
-                    UserAnnotation()
-                    if let active = session.coordinate, isActive {
-                        Annotation(activeName ?? "Here", coordinate: active) {
-                            pin(color: .green, icon: "location.fill")
-                        }
-                    }
-                    if let selected, !isSame(selected, session.coordinate) || !isActive {
-                        Annotation(selectedName ?? "Selected", coordinate: selected) {
-                            pin(color: .blue, icon: "mappin")
-                        }
-                    }
-                }
-                .mapControls { MapCompass() }
-                .onTapGesture { point in
-                    searchFocused = false
-                    if let coordinate = proxy.convert(point, from: .local) {
-                        select(coordinate, name: nil)
-                    }
-                }
-            }
-            .frame(height: 300)
-            .overlay(alignment: .bottomLeading) {
-                if let selected {
-                    Text(selectedName ?? format(selected))
-                        .font(.footnote.weight(.medium))
-                        .lineLimit(1)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(10)
-                } else {
-                    Text("Tap the map to drop a pin")
-                        .font(.footnote)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .padding(10)
-                }
-            }
-        }
-        .background(.background)
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-    }
-
-    private func pin(color: Color, icon: String) -> some View {
-        Image(systemName: icon)
-            .font(.system(size: 14, weight: .bold))
-            .foregroundStyle(.white)
-            .frame(width: 32, height: 32)
-            .background(color, in: Circle())
-            .overlay(Circle().stroke(.white, lineWidth: 3))
-            .shadow(radius: 3)
-    }
-
-    private var searchBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            TextField("Search a place or paste coordinates", text: $searchText)
-                .focused($searchFocused)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .submitLabel(.search)
-                .onChange(of: searchText) { _, value in searchCompleter.update(query: value) }
-                .onSubmit { submitSearchText() }
-            if !searchText.isEmpty {
-                Button {
-                    searchText = ""
-                    searchCompleter.update(query: "")
-                } label: {
-                    Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
-                }
-            }
-        }
-        .padding(12)
-    }
-
-    private var searchResults: some View {
-        VStack(spacing: 0) {
-            ForEach(Array(searchCompleter.results.prefix(5).enumerated()), id: \.offset) { _, result in
-                Button {
-                    resolve(result)
-                } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(result.title).font(.subheadline).foregroundStyle(.primary)
-                        if !result.subtitle.isEmpty {
-                            Text(result.subtitle).font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                }
-                Divider().padding(.leading, 14)
-            }
-        }
-    }
-
-    // MARK: - Actions
-
-    private var actionButtons: some View {
-        VStack(spacing: 10) {
-            if isActive {
-                bigButton(title: "Stop – Use Real Location", icon: "stop.fill", color: .red) {
-                    stop()
-                }
-            }
-            if let selected, !(isActive && isSame(selected, session.coordinate)) {
-                bigButton(title: "Go Here", icon: "location.fill", color: .accentColor) {
-                    go(to: selected, name: selectedName)
-                }
-            }
-            if selected != nil {
-                Button {
-                    saveName = selectedName ?? ""
-                    showSaveSheet = true
-                } label: {
-                    Label("Save This Spot", systemImage: "star")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
-                        .background(.background, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                }
-            }
-        }
-        .disabled(isBusy)
-        .overlay {
-            if isBusy { ProgressView().controlSize(.large) }
-        }
-    }
-
-    private func bigButton(title: String, icon: String, color: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Label(title, systemImage: icon)
-                .font(.headline)
-                .foregroundStyle(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 16)
-                .background(color, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        }
-        .opacity(isBusy ? 0.5 : 1)
-    }
-
-    // MARK: - Saved spots
-
-    private var spotsSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Saved Spots").font(.title3.weight(.bold))
-                Spacer()
-                if !spots.isEmpty {
-                    Text("\(spots.count)").font(.subheadline).foregroundStyle(.secondary)
-                }
-            }
-            if spots.isEmpty {
-                VStack(spacing: 6) {
-                    Image(systemName: "star").font(.title2).foregroundStyle(.secondary)
-                    Text("No saved spots yet").font(.subheadline.weight(.semibold))
-                    Text("Drop a pin, then tap Save This Spot.")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 24)
-                .background(.background, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-            } else {
-                VStack(spacing: 0) {
+    @ViewBuilder
+    private var spotChips: some View {
+        if spots.isEmpty {
+            Text(selected == nil ? "Tap the map to drop a pin" : "Tap the star to save this spot")
+                .font(.footnote.weight(.medium))
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .teleportGlass(Capsule())
+        } else {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
                     ForEach(spots) { spot in
-                        spotRow(spot)
-                        if spot.id != spots.last?.id {
-                            Divider().padding(.leading, 60)
-                        }
+                        spotChip(spot)
                     }
                 }
-                .background(.background, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                Text("Tap a spot to go there. Press and hold to rename or delete.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
             }
         }
     }
 
-    private func spotRow(_ spot: LocationBookmark) -> some View {
+    private func spotChip(_ spot: LocationBookmark) -> some View {
         let isCurrent = isActive && isSame(spot.coordinate, session.coordinate)
         return Button {
-            select(spot.coordinate, name: spot.name)
+            selected = spot.coordinate
+            selectedName = spot.name
+            withAnimation { position = .region(region(around: spot.coordinate)) }
             go(to: spot.coordinate, name: spot.name)
         } label: {
-            HStack(spacing: 12) {
-                Image(systemName: isCurrent ? "location.fill" : "mappin.circle.fill")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .frame(width: 36, height: 36)
-                    .background(isCurrent ? Color.green : Color.accentColor, in: Circle())
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(spot.name).font(.body.weight(.semibold)).foregroundStyle(.primary)
-                    Text(isCurrent ? "You're here" : format(spot.coordinate))
-                        .font(.caption)
-                        .foregroundStyle(isCurrent ? .green : .secondary)
-                }
-                Spacer()
-                Image(systemName: "chevron.right").font(.footnote).foregroundStyle(.tertiary)
+            HStack(spacing: 6) {
+                Image(systemName: isCurrent ? "location.fill" : "mappin")
+                    .font(.caption.weight(.bold))
+                Text(spot.name)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
             }
-            .padding(.horizontal, 12)
+            .foregroundStyle(isCurrent ? Color.white : Color.primary)
+            .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .contentShape(Rectangle())
+            .teleportGlass(Capsule(), tint: isCurrent ? .blue : nil)
         }
+        .buttonStyle(.plain)
         .disabled(isBusy)
         .contextMenu {
-            Button { select(spot.coordinate, name: spot.name) } label: {
+            Button {
+                selected = spot.coordinate
+                selectedName = spot.name
+                withAnimation { position = .region(region(around: spot.coordinate)) }
+            } label: {
                 Label("Show on Map", systemImage: "map")
             }
             Button {
@@ -385,47 +326,199 @@ struct QuickSpotsView: View {
         }
     }
 
-    private var saveSheet: some View {
-        NavigationStack {
-            Form {
-                Section("Name") {
-                    TextField("e.g. Main Gate", text: $saveName)
+    private var bottomBar: some View {
+        HStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search", text: $searchText)
+                    .focused($searchFocused)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .submitLabel(.search)
+                    .onChange(of: searchText) { _, value in searchCompleter.update(query: value) }
+                    .onSubmit { submitSearchText() }
+                if searchFocused || !searchText.isEmpty {
+                    Button {
+                        searchText = ""
+                        searchCompleter.update(query: "")
+                        searchFocused = false
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .accessibilityLabel("Cancel search")
                 }
-                if let selected {
-                    Section("Coordinates") {
-                        Text(format(selected)).font(.body.monospaced())
+            }
+            .padding(.horizontal, 16)
+            .frame(height: 52)
+            .teleportGlass(Capsule())
+
+            if !searchFocused {
+                roundAction(icon: "location.north.fill", color: .blue, label: "Teleport here",
+                            enabled: canTeleport) {
+                    if let selected { go(to: selected, name: selectedName) }
+                }
+                roundAction(icon: "stop.fill", color: .red, label: "Stop teleport",
+                            enabled: isActive) {
+                    stop()
+                }
+                roundAction(icon: isSelectedSaved ? "star.fill" : "star", color: .yellow, label: "Save spot",
+                            enabled: selected != nil && !isSelectedSaved) {
+                    saveName = selectedName ?? ""
+                    showSavePrompt = true
+                }
+            }
+        }
+    }
+
+    private var canTeleport: Bool {
+        guard let selected, !isBusy else { return false }
+        return !(isActive && isSame(selected, session.coordinate))
+    }
+
+    private var isSelectedSaved: Bool {
+        guard let selected else { return false }
+        return spots.contains { isSame($0.coordinate, selected) }
+    }
+
+    private var searchResults: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(searchCompleter.results.prefix(5).enumerated()), id: \.offset) { index, result in
+                Button {
+                    resolve(result)
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "mappin.circle.fill")
+                            .font(.title3)
+                            .foregroundStyle(.red)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(result.title)
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            if !result.subtitle.isEmpty {
+                                Text(result.subtitle)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if index < min(searchCompleter.results.count, 5) - 1 {
+                    Divider().padding(.leading, 52)
+                }
+            }
+        }
+        .padding(.vertical, 4)
+        .teleportGlass(RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    // MARK: Buttons
+
+    private func circleButton(icon: String, label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 46, height: 46)
+                .teleportGlass(Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    private func roundAction(icon: String, color: Color, label: String, enabled: Bool,
+                             action: @escaping () -> Void) -> some View {
+        Button {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            action()
+        } label: {
+            Image(systemName: icon)
+                .font(.system(size: 19, weight: .bold))
+                .foregroundStyle(enabled ? color : Color.secondary.opacity(0.6))
+                .frame(width: 52, height: 52)
+                .teleportGlass(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled || isBusy)
+        .accessibilityLabel(label)
+    }
+
+    // MARK: Menu sheet
+
+    private var menuSheet: some View {
+        NavigationStack {
+            List {
+                Section {
+                    NavigationLink {
+                        SettingsView()
+                    } label: {
+                        Label("Settings & Pairing File", systemImage: "gearshape")
+                    }
+                    NavigationLink {
+                        ToolsView()
+                    } label: {
+                        Label("Advanced Tools", systemImage: "wrench.and.screwdriver")
+                    }
+                    NavigationLink {
+                        HomeView()
+                    } label: {
+                        Label("JIT", systemImage: "bolt.fill")
+                    }
+                }
+                Section("Saved Spots") {
+                    if spots.isEmpty {
+                        Text("No saved spots yet")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(spots) { spot in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(spot.name)
+                            Text(format(spot.coordinate))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .onDelete { offsets in
+                        spots.remove(atOffsets: offsets)
+                        persistSpots()
+                    }
+                    .onMove { source, destination in
+                        spots.move(fromOffsets: source, toOffset: destination)
+                        persistSpots()
                     }
                 }
             }
-            .navigationTitle("Save Spot")
+            .navigationTitle("Teleport")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { showSaveSheet = false }
+                ToolbarItem(placement: .topBarLeading) {
+                    if !spots.isEmpty { EditButton() }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") { saveSelected() }
-                        .disabled(saveName.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button("Done") { showMenu = false }
                 }
             }
         }
-        .presentationDetents([.medium])
+        .presentationDetents([.medium, .large])
     }
 
-    // MARK: - Logic
-
-    private func select(_ coordinate: CLLocationCoordinate2D, name: String?) {
-        selected = coordinate
-        selectedName = name
-        withAnimation { position = .region(region(around: coordinate)) }
-    }
+    // MARK: Logic
 
     private func go(to coordinate: CLLocationCoordinate2D, name: String?) {
         guard hasPairingFile else {
-            errorMessage = "Import your pairing file in Settings first."
+            errorMessage = "Import your pairing file first (gear button → Settings & Pairing File)."
             return
         }
         guard !isBusy else { return }
+        searchFocused = false
         isBusy = true
         let path = pairingPath
         let ip = DeviceConnectionContext.targetIPAddress
@@ -437,7 +530,7 @@ struct QuickSpotsView: View {
                     errorMessage = "Error \(code). Make sure LocalDevVPN is on and you're on Wi-Fi, then try again."
                     return
                 }
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
                 activeName = name
                 beginBackgroundTask()
                 session.clearRoute()
@@ -462,10 +555,27 @@ struct QuickSpotsView: View {
                 activeName = nil
                 endBackgroundTask()
                 if code != 0 {
-                    errorMessage = "The app stopped sending the fake location. If Maps still shows it, restart your iPhone."
-                } else {
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    errorMessage = "Teleport stopped sending the fake location. If Maps still shows it, restart your iPhone."
                 }
+            }
+        }
+    }
+
+    private func recenter() {
+        if isActive, let coordinate = session.coordinate {
+            withAnimation { position = .region(region(around: coordinate)) }
+        } else if let selected {
+            withAnimation { position = .region(region(around: selected)) }
+        } else {
+            withAnimation { position = .userLocation(fallback: .automatic) }
+        }
+    }
+
+    private func flashStyleToast(_ text: String) {
+        withAnimation { styleToast = text }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            if styleToast == text {
+                withAnimation { styleToast = nil }
             }
         }
     }
@@ -477,7 +587,10 @@ struct QuickSpotsView: View {
         MKLocalSearch(request: MKLocalSearch.Request(completion: completion)).start { response, _ in
             guard let item = response?.mapItems.first else { return }
             DispatchQueue.main.async {
-                select(item.placemark.coordinate, name: completion.title)
+                let coordinate = item.placemark.coordinate
+                selected = coordinate
+                selectedName = completion.title
+                withAnimation { position = .region(region(around: coordinate)) }
             }
         }
     }
@@ -489,10 +602,13 @@ struct QuickSpotsView: View {
             .split(whereSeparator: { $0 == "," || $0 == " " })
             .compactMap { Double($0) }
         if parts.count == 2, abs(parts[0]) <= 90, abs(parts[1]) <= 180 {
+            let coordinate = CLLocationCoordinate2D(latitude: parts[0], longitude: parts[1])
             searchFocused = false
             searchText = ""
             searchCompleter.update(query: "")
-            select(CLLocationCoordinate2D(latitude: parts[0], longitude: parts[1]), name: nil)
+            selected = coordinate
+            selectedName = nil
+            withAnimation { position = .region(region(around: coordinate)) }
         } else if let first = searchCompleter.results.first {
             resolve(first)
         }
@@ -504,8 +620,9 @@ struct QuickSpotsView: View {
         guard !name.isEmpty else { return }
         spots.append(LocationBookmark(name: name, latitude: selected.latitude, longitude: selected.longitude))
         selectedName = name
+        if isActive && isSame(selected, session.coordinate) { activeName = name }
         persistSpots()
-        showSaveSheet = false
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
     }
 
     private func commitRename() {
@@ -547,10 +664,10 @@ struct QuickSpotsView: View {
         backgroundTaskID = .invalid
     }
 
-    // MARK: - Helpers
+    // MARK: Helpers
 
     private func region(around coordinate: CLLocationCoordinate2D) -> MKCoordinateRegion {
-        MKCoordinateRegion(center: coordinate, latitudinalMeters: 800, longitudinalMeters: 800)
+        MKCoordinateRegion(center: coordinate, latitudinalMeters: 700, longitudinalMeters: 700)
     }
 
     private func isSame(_ a: CLLocationCoordinate2D?, _ b: CLLocationCoordinate2D?) -> Bool {
