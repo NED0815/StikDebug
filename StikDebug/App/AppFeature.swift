@@ -6,6 +6,7 @@
 import SwiftUI
 
 enum AppFeature: String, CaseIterable, Identifiable {
+    case spots
     case home
     case scripts
     case tools
@@ -23,6 +24,8 @@ enum AppFeature: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .spots:
+            return "Spots"
         case .home:
             return "JIT"
         case .scripts:
@@ -48,6 +51,8 @@ enum AppFeature: String, CaseIterable, Identifiable {
 
     var detail: String {
         switch self {
+        case .spots:
+            return "Pick a spot and set your location"
         case .home:
             return "Enable JIT for installed apps"
         case .scripts:
@@ -82,6 +87,8 @@ enum AppFeature: String, CaseIterable, Identifiable {
 
     var systemImage: String {
         switch self {
+        case .spots:
+            return "mappin.and.ellipse"
         case .home:
             return "bolt.fill"
         case .scripts:
@@ -108,6 +115,8 @@ enum AppFeature: String, CaseIterable, Identifiable {
     @ViewBuilder
     var destination: some View {
         switch self {
+        case .spots:
+            QuickSpotsView()
         case .home:
             HomeView()
         case .scripts:
@@ -133,6 +142,6 @@ enum AppFeature: String, CaseIterable, Identifiable {
 }
 
 extension AppFeature {
-    static let mainTabs: [AppFeature] = [.home, .tools, .settings]
+    static let mainTabs: [AppFeature] = [.spots, .home, .tools, .settings]
     static let toolList: [AppFeature] = [.launchApps, .scripts, .console, .deviceInfo, .profiles, .processes, .location]
 }
