@@ -51,7 +51,7 @@ private enum ExternalLocationAction: Identifiable {
 }
 
 struct MainTabView: View {
-    @AppStorage("primaryTabSelection") private var selection: String = AppFeature.home.id
+    @AppStorage("primaryTabSelection") private var selection: String = AppFeature.spots.id
     @State private var detachedFeature: AppFeature?
     @State private var didSetInitialHome = false
     @State private var pendingLocationAction: ExternalLocationAction?
@@ -70,7 +70,7 @@ struct MainTabView: View {
             .onAppear {
                 ensureSelectionIsValid()
                 if !didSetInitialHome {
-                    selection = AppFeature.home.id
+                    selection = AppFeature.spots.id
                     didSetInitialHome = true
                 }
             }
@@ -120,7 +120,7 @@ struct MainTabView: View {
         if ids.contains(selection) {
             return
         }
-        selection = AppFeature.home.id
+        selection = AppFeature.spots.id
     }
 
     private func handleURL(_ url: URL) {
